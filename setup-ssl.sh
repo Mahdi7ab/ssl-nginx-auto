@@ -6,8 +6,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 if [ $# -lt 3 ]; then
-  echo -e "${RED}[✗] استفاده: $0 email domain1 [domain2...] container:port${NC}"
-  echo "مثال: $0 mahdi7ab@gmail.com api.tavadentco.ir tavadentco_api:80"
+  echo -e "${RED}[x] استفاده: $0 email domain1 [domain2 ...] container:port${NC}"
   exit 1
 fi
 
@@ -15,117 +14,80 @@ EMAIL="$1"
 shift
 PROXY_TARGET="${!#}"
 DOMAINS="${@:1:$#-1}"
-
-if [ -z "$DOMAINS" ]; then
-  echo -e "${RED}[✗] حداقل یک دامنه لازم است${NC}"
-  exit 1
-fi
-
-if [[ ! "$PROXY_TARGET" =~ .*:.* ]]; then
-  echo -e "${RED}[✗] Proxy target باید container:port باشه${NC}"
-  exit 1
-fi
-
 DOMAINS_LIST=$(echo "$DOMAINS" | tr ' ' ',')
 MAIN_DOMAIN=$(echo "$DOMAINS" | awk '{print $1}')
+WEBROOT="/srv/infra/certbot/www"
+TEMP_CONFIG="/srv/infra/nginx/conf.d/letsencrypt-challenge.conf"
+FINAL_CONFIG="/srv/infra/nginx/conf.d/${MAIN_DOMAIN//./_}.conf"
 
-echo -e "${YELLOW}[+] ایمیل:${NC} $EMAIL"
-echo -e "${YELLOW}[+] دامنه(ها):${NC} $DOMAINS_LIST"
-echo -e "${YELLOW}[+] Proxy Target:${NC} $PROXY_TARGET"
+echo -e "${YELLOW}[+] دامنه(ها): $DOMAINS_LIST${NC}"
+echo -e "${YELLOW}[+] Proxy: $PROXY_TARGET${NC}"
 
-# مسیرهای داخل کانتینر
-NGINX_CONTAINER="infra-nginx"
-WEBROOT="/var/www/certbot"
-SSL_DIR="/etc/letsencrypt"
-CONFIG_DIR="/etc/nginx/conf.d"
-
-# چک کردن وجود کانتینر
-if ! docker ps | grep -q "$NGINX_CONTAINER"; then
-  echo -e "${RED}[✗] کانتینر $NGINX_CONTAINER اجرا نیست!${NC}"
-  exit 1
-fi
-
-# ساخت وب‌روت
-docker exec "$NGINX_CONTAINER" mkdir -p "$WEBROOT"
-
-# موقت: کانفیگ چالش
-TEMP_CONFIG="$CONFIG_DIR/letsencrypt-challenge.conf"
-docker exec "$NGINX_CONTAINER" sh -c "cat > $TEMP_CONFIG" <<EOF
+# 1. config موقت
+cat > "$TEMP_CONFIG" << EOF
 server {
     listen 80;
     server_name $(echo "$DOMAINS_LIST" | sed 's/,/ /g');
 
     location /.well-known/acme-challenge/ {
-        root $WEBROOT;
+        root /var/www/certbot;
         try_files \$uri =404;
     }
 
-    location / {
-        return 410;
-    }
+    location / { return 502; }
 }
 EOF
 
-docker exec "$NGINX_CONTAINER" nginx -t && docker exec "$NGINX_CONTAINER" nginx -s reload
+docker exec infra-nginx nginx -t && docker exec infra-nginx nginx -s reload
 
-# اجرای Certbot داخل Docker
-echo -e "${YELLOW}[+] در حال دریافت گواهی...${NC}"
-docker run --rm \
-  -v "$(pwd)/ssl:$SSL_DIR" \
-  -v "$(pwd)/../certbot/www:$WEBROOT" \
-  --network web \
-  certbot/certbot \
-  certonly --webroot -w "$WEBROOT" \
+# 2. دریافت گواهی
+docker exec infra-certbot certbot certonly \
+  --webroot -w /var/www/certbot \
   -d $(echo "$DOMAINS_LIST" | sed 's/,/ -d /g') \
-  --email "$EMAIL" --agree-tos --no-eff-email || {
-    echo -e "${RED}[✗] خطا در دریافت گواهی${NC}"
-    docker exec "$NGINX_CONTAINER" rm -f "$TEMP_CONFIG"
-    docker exec "$NGINX_CONTAINER" nginx -s reload
+  --email "$EMAIL" --agree-tos --non-interactive --force-renewal || {
+    echo -e "${RED}[x] خطا در دریافت گواهی${NC}"
+    rm -f "$TEMP_CONFIG"
+    docker exec infra-nginx nginx -s reload 2>/dev/null || true
     exit 1
 }
 
-# حذف کانفیگ موقت
-docker exec "$NGINX_CONTAINER" rm -f "$TEMP_CONFIG"
-docker exec "$NGINX_CONTAINER" nginx -s reload
+# 3. حذف config موقت
+rm -f "$TEMP_CONFIG"
 
-# ساخت کانفیگ اصلی
-CONFIG_FILE="$CONFIG_DIR/${MAIN_DOMAIN//./_}.conf"
-SERVER_NAMES=$(echo "$DOMAINS" | sed 's/^/    server_name /; s/ /;\n    server_name /g' | sed 's/$/;/')
+UPSTREAM_NAME="${MAIN_DOMAIN//./_}"
 
-docker exec "$NGINX_CONTAINER" sh -c "cat > $CONFIG_FILE" <<EOF
-upstream backend {
-    server $PROXY_TARGET;
-}
+cat > "$FINAL_CONFIG" << EOF
+upstream $UPSTREAM_NAME { server $PROXY_TARGET; }
 
 server {
     listen 80;
     server_name $(echo "$DOMAINS_LIST" | sed 's/,/ /g');
-    location /.well-known/acme-challenge/ { root $WEBROOT; }
+    location /.well-known/acme-challenge/ { root /var/www/certbot; try_files \$uri =404; }
     location / { return 301 https://\$host\$request_uri; }
 }
 
 server {
     listen 443 ssl http2;
-$SERVER_NAMES
-    ssl_certificate $SSL_DIR/live/$MAIN_DOMAIN/fullchain.pem;
-    ssl_certificate_key $SSL_DIR/live/$MAIN_DOMAIN/privkey.pem;
+    server_name $(echo "$DOMAINS_LIST" | sed 's/,/ /g');
+    ssl_certificate /etc/letsencrypt/live/$MAIN_DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$MAIN_DOMAIN/privkey.pem;
 
-    location /.well-known/acme-challenge/ { root $WEBROOT; }
+    location /.well-known/acme-challenge/ { root /var/www/certbot; try_files \$uri =404; }
     location / {
-        proxy_pass http://backend;
+        proxy_pass http://$UPSTREAM_NAME;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 }
 EOF
 
-# ری‌لود نهایی
-if docker exec "$NGINX_CONTAINER" nginx -t && docker exec "$NGINX_CONTAINER" nginx -s reload; then
-    echo -e "${GREEN}[✓] SSL با موفقیت تنظیم شد: $DOMAINS_LIST${NC}"
-    echo -e "${GREEN}[✓] کانفیگ: ./conf.d/$(basename $CONFIG_FILE)${NC}"
+# 5. ری‌لود نهایی
+if docker exec infra-nginx nginx -t && docker exec infra-nginx nginx -s reload; then
+    echo -e "${GREEN}[Success] SSL تنظیم شد: https://$MAIN_DOMAIN${NC}"
 else
-    echo -e "${RED}[✗] خطا در Nginx${NC}"
+    echo -e "${RED}[x] خطا در Nginx${NC}"
     exit 1
 fi
