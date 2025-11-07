@@ -71,7 +71,7 @@
 ### 1. دانلود و آماده‌سازی
 
 ```bash
-git clone https://github.com/yourname/ssl-nginx-auto.git
+git clone https://github.com/Mahdi7ab/ssl-nginx-auto.git
 cd ssl-nginx-auto
 chmod +x setup-ssl.sh
 ```
